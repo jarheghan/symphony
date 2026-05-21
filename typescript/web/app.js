@@ -73,8 +73,8 @@ function Brand() {
         </svg>
       </div>
       <div>
-        <div class="brand-name">Symphony</div>
-        <div class="brand-tag">Claude · GitHub orchestrator</div>
+        <div class="brand-name">Extraction</div>
+        <div class="brand-tag">Agent orchestrator [Claude · GitHub]</div>
       </div>
     </div>
   `;
