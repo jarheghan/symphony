@@ -1,11 +1,13 @@
 // Workspace manager (Section 9). Per-issue directories, hook lifecycle, safety invariants.
 
 import fs from "node:fs/promises";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import type { HooksConfig, Issue, Workspace } from "../types.js";
 import { normalizeWorkspacePath, workspaceKey } from "../util/path.js";
 import { log } from "../logging/logger.js";
+import { treeKill } from "../util/process.js";
 
 export class WorkspaceError extends Error {
   constructor(public code: string, message: string) {
@@ -65,7 +67,23 @@ export class WorkspaceManager {
       const env = {} as Record<string, string>;
       await runHookBestEffort("before_remove", hooks.before_remove, wp, env, hooks.timeout_ms);
     }
-    await fs.rm(wp, { recursive: true, force: true });
+    // Retry with backoff: on Windows, a grandchild process (claude.exe spawned
+    // under bash) can briefly keep the directory locked as its CWD after the
+    // worker is signalled. Tree-kill should release it, but propagation isn't
+    // instant — give it a few tries before giving up.
+    const delaysMs = [0, 250, 1000, 3000];
+    let lastErr: unknown;
+    for (const d of delaysMs) {
+      if (d > 0) await new Promise((r) => setTimeout(r, d));
+      try {
+        await fs.rm(wp, { recursive: true, force: true });
+        return;
+      } catch (e: any) {
+        lastErr = e;
+        if (!isRetryableRmError(e)) throw e;
+      }
+    }
+    throw lastErr;
   }
 }
 
@@ -83,6 +101,37 @@ export function hookEnv(issue: Issue, workspacePath: string, attempt: number | n
   };
 }
 
+let resolvedBashPath: string | undefined;
+
+// Pick a bash binary that won't dispatch into WSL. On Windows, the unqualified
+// "bash" on PATH is typically C:\Windows\System32\bash.exe — the WSL launcher,
+// which fails with `execvpe(/bin/bash) failed` when no WSL distro is registered.
+// Prefer SYMPHONY_BASH, then Git Bash, then plain "bash" (correct on Linux/macOS).
+export function resolveBashPath(): string {
+  if (resolvedBashPath !== undefined) return resolvedBashPath;
+  const override = process.env.SYMPHONY_BASH;
+  if (override && override.length > 0) {
+    resolvedBashPath = override;
+    return resolvedBashPath;
+  }
+  if (process.platform === "win32") {
+    const candidates = [
+      "C:\\Program Files\\Git\\bin\\bash.exe",
+      "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+      "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+      "C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe",
+    ];
+    for (const c of candidates) {
+      if (existsSync(c)) {
+        resolvedBashPath = c;
+        return resolvedBashPath;
+      }
+    }
+  }
+  resolvedBashPath = "bash";
+  return resolvedBashPath;
+}
+
 export async function runHook(
   name: string,
   script: string,
@@ -91,7 +140,7 @@ export async function runHook(
   timeoutMs: number,
 ): Promise<{ ok: boolean; code: number | null; stdout: string; stderr: string; error?: string }> {
   return new Promise((resolve) => {
-    const child = spawn("bash", ["-lc", script], {
+    const child = spawn(resolveBashPath(), ["-lc", script], {
       cwd,
       env: { ...process.env, ...env },
       stdio: ["ignore", "pipe", "pipe"],
@@ -101,14 +150,12 @@ export async function runHook(
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      try {
-        child.kill("SIGTERM");
+      if (child.pid) {
+        treeKill(child.pid, "SIGTERM");
         setTimeout(() => {
-          try {
-            child.kill("SIGKILL");
-          } catch {}
+          if (child.pid && !child.killed) treeKill(child.pid, "SIGKILL");
         }, 2000);
-      } catch {}
+      }
     }, timeoutMs);
 
     child.stdout.on("data", (d) => {
@@ -160,4 +207,14 @@ export async function runHookBestEffort(
 
 function truncate(s: string, n = 4096): string {
   return s.length > n ? s.slice(0, n) + `...<${s.length - n} more bytes>` : s;
+}
+
+function isRetryableRmError(e: any): boolean {
+  const code = e?.code;
+  return (
+    code === "EBUSY" ||
+    code === "EPERM" ||
+    code === "EACCES" ||
+    code === "ENOTEMPTY"
+  );
 }

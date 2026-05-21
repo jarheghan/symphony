@@ -605,7 +605,28 @@ export class Orchestrator extends EventEmitter {
     const runtimeSec = (Date.now() - Date.parse(entry.started_at)) / 1000;
     this.claude_totals.seconds_running += runtimeSec;
     const cfg = this.cfg();
-    if (entry.status === "Succeeded") {
+    const stateLower = (entry.issue.state || "").toLowerCase();
+    const termLower = new Set(cfg.tracker.terminal_states.map((s) => s.toLowerCase()));
+    const isTerminal = entry.issue.github_state === "closed" || termLower.has(stateLower);
+    if (isTerminal) {
+      if (entry.status === "Succeeded") this.completed.add(entry.issue_id);
+      void this.workspaceManager
+        .removeForIssue(entry.identifier, cfg.hooks)
+        .then(() =>
+          log.info("workspace_removed", {
+            issue_id: entry.issue_id,
+            issue_identifier: entry.identifier,
+            state: entry.issue.state,
+          }),
+        )
+        .catch((e: any) =>
+          log.warn("workspace_remove_failed", {
+            issue_id: entry.issue_id,
+            issue_identifier: entry.identifier,
+            error: e?.message,
+          }),
+        );
+    } else if (entry.status === "Succeeded") {
       this.completed.add(entry.issue_id);
       // Continuation retry after ~1s
       this.scheduleRetry(
@@ -633,6 +654,7 @@ export class Orchestrator extends EventEmitter {
       runtime_seconds: runtimeSec.toFixed(1),
       session_id: entry.session_id,
       total_cost_usd: entry.total_cost_usd.toFixed(4),
+      error: entry.error ?? undefined,
     });
     this.emit("snapshot", this.snapshot());
   }

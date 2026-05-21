@@ -6,6 +6,8 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import type { ClaudeConfig, RuntimeEvent } from "../types.js";
 import { log } from "../logging/logger.js";
+import { resolveBashPath } from "../workspace/manager.js";
+import { treeKill } from "../util/process.js";
 
 export type ClaudeRunnerEvent = RuntimeEvent;
 
@@ -81,7 +83,7 @@ export async function runTurn(ctx: TurnContext): Promise<TurnResult> {
   const startMs = Date.now();
 
   log.debug("claude launching", { cwd: ctx.cwd, turn: ctx.turnNumber });
-  const child: ChildProcess = spawn("bash", ["-lc", escapedCommand], {
+  const child: ChildProcess = spawn(resolveBashPath(), ["-lc", escapedCommand], {
     cwd: ctx.cwd,
     env: {
       ...process.env,
@@ -124,11 +126,9 @@ export async function runTurn(ctx: TurnContext): Promise<TurnResult> {
     }
   };
 
-  const killSubtree = (sig: NodeJS.Signals = "SIGTERM") => {
+  const killSubtree = (sig: "SIGTERM" | "SIGKILL" = "SIGTERM") => {
     if (child.pid && !child.killed) {
-      try {
-        child.kill(sig);
-      } catch {}
+      treeKill(child.pid, sig);
     }
   };
 
