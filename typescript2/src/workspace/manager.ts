@@ -1,11 +1,19 @@
-// Workspace manager (Section 9). Per-issue directories, hook lifecycle, safety invariants.
+// Workspace manager (Section 9). Per-issue directories, hook lifecycle, safety
+// invariants.
+//
+// PowerShell edition: workspace hooks (`after_create`, `before_run`, `after_run`,
+// `before_remove`) are authored in PowerShell and executed by writing the script
+// to a temporary `.ps1` file and running it with the resolved PowerShell host —
+// replacing the spec's `bash -lc` convention.
 
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import type { HooksConfig, Issue, Workspace } from "../types.js";
 import { normalizeWorkspacePath, workspaceKey } from "../util/path.js";
 import { log } from "../logging/logger.js";
+import { PWSH_BASE_FLAGS, powershellExecutable } from "../util/powershell.js";
 
 export class WorkspaceError extends Error {
   constructor(public code: string, message: string) {
@@ -75,7 +83,11 @@ export class WorkspaceManager {
   }
 }
 
-export function hookEnv(issue: Issue, workspacePath: string, attempt: number | null): Record<string, string> {
+export function hookEnv(
+  issue: Issue,
+  workspacePath: string,
+  attempt: number | null,
+): Record<string, string> {
   return {
     SYMPHONY_ISSUE_ID: issue.id,
     SYMPHONY_ISSUE_IDENTIFIER: issue.identifier,
@@ -91,6 +103,28 @@ export function hookEnv(issue: Issue, workspacePath: string, attempt: number | n
   };
 }
 
+/**
+ * Wrap a user hook script so that:
+ *  - PowerShell cmdlet errors abort the hook (`$ErrorActionPreference = 'Stop'`),
+ *  - the script's exit code reflects the last native command (bash-`-lc` parity),
+ *  - thrown exceptions surface on stderr and produce a non-zero exit.
+ */
+function wrapHookScript(script: string): string {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    "try {",
+    script,
+    "} catch {",
+    "  [Console]::Error.WriteLine($_.Exception.Message)",
+    "  exit 1",
+    "}",
+    "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }",
+    "exit 0",
+    "",
+  ].join("\n");
+}
+
 export async function runHook(
   name: string,
   script: string,
@@ -98,12 +132,37 @@ export async function runHook(
   env: Record<string, string>,
   timeoutMs: number,
 ): Promise<{ ok: boolean; code: number | null; stdout: string; stderr: string; error?: string }> {
-  return new Promise((resolve) => {
-    const child = spawn("bash", ["-lc", script], {
-      cwd,
-      env: { ...process.env, ...env },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+  // Write the hook to a temp .ps1 file (with a UTF-8 BOM so Windows PowerShell
+  // 5.1 reads non-ASCII content correctly) and execute it with `-File`.
+  const rand = Math.random().toString(36).slice(2, 8);
+  const tmpFile = path.join(
+    os.tmpdir(),
+    `symphony-hook-${name}-${process.pid}-${Date.now()}-${rand}.ps1`,
+  );
+  try {
+    await fs.writeFile(tmpFile, "﻿" + wrapHookScript(script), "utf8");
+  } catch (e: any) {
+    log.warn(`hook=${name} failed`, { error: `temp_script_write_failed: ${e.message}` });
+    return { ok: false, code: null, stdout: "", stderr: "", error: "temp_script_write_failed" };
+  }
+
+  const result = await new Promise<{
+    ok: boolean;
+    code: number | null;
+    stdout: string;
+    stderr: string;
+    error?: string;
+  }>((resolve) => {
+    const child = spawn(
+      powershellExecutable(),
+      [...PWSH_BASE_FLAGS, "-File", tmpFile],
+      {
+        cwd,
+        env: { ...process.env, ...env },
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      },
+    );
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -119,11 +178,11 @@ export async function runHook(
       } catch {}
     }, timeoutMs);
 
-    child.stdout.on("data", (d) => {
+    child.stdout?.on("data", (d) => {
       stdout += d.toString();
       if (stdout.length > 64_000) stdout = stdout.slice(-64_000);
     });
-    child.stderr.on("data", (d) => {
+    child.stderr?.on("data", (d) => {
       stderr += d.toString();
       if (stderr.length > 64_000) stderr = stderr.slice(-64_000);
     });
@@ -147,9 +206,14 @@ export async function runHook(
     });
     child.on("error", (e) => {
       clearTimeout(timer);
+      log.warn(`hook=${name} failed`, { error: e.message });
       resolve({ ok: false, code: null, stdout, stderr, error: e.message });
     });
   });
+
+  // Best-effort temp file cleanup.
+  fs.rm(tmpFile, { force: true }).catch(() => {});
+  return result;
 }
 
 export async function runHookBestEffort(

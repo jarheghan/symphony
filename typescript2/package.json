@@ -1,0 +1,28 @@
+{
+  "name": "symphony-ts",
+  "version": "0.2.0",
+  "description": "TypeScript implementation of Symphony (Claude Code + GitHub profile) — PowerShell edition",
+  "type": "module",
+  "bin": {
+    "symphony": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "chokidar": "^4.0.1",
+    "liquidjs": "^10.16.1",
+    "yaml": "^2.5.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2"
+  }
+}

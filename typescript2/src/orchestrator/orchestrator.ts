@@ -4,7 +4,6 @@
 // retry queue, reconciliation, and run-attempt lifecycle.
 
 import { EventEmitter } from "node:events";
-import path from "node:path";
 import { log } from "../logging/logger.js";
 import type {
   ClaudeTotals,
@@ -19,11 +18,7 @@ import type {
 import { GitHubTracker, TrackerError } from "../tracker/github.js";
 import { WorkspaceManager, hookEnv, runHook, runHookBestEffort } from "../workspace/manager.js";
 import { runTurn, validateAddDirs } from "../agent/claude.js";
-import {
-  buildContinuationPrompt,
-  renderPrompt,
-  PromptError,
-} from "../prompt/render.js";
+import { buildContinuationPrompt, renderPrompt, PromptError } from "../prompt/render.js";
 import { validateDispatchConfig } from "../workflow/config.js";
 
 interface RunningInternal extends RunningEntry {
@@ -120,7 +115,9 @@ export class Orchestrator extends EventEmitter {
     for (const r of this.retry_attempts.values()) {
       if (r.timer) clearTimeout(r.timer);
     }
-    await Promise.all(Array.from(this.running.values()).map((r) => r.workerPromise.catch(() => {})));
+    await Promise.all(
+      Array.from(this.running.values()).map((r) => r.workerPromise.catch(() => {})),
+    );
     log.info("orchestrator stopped");
   }
 
@@ -280,7 +277,9 @@ export class Orchestrator extends EventEmitter {
   private async maybeDispatch(issue: Issue, attempt: number | null): Promise<void> {
     if (this.running.has(issue.id) || this.claimed.has(issue.id)) return;
     if (!this.hasGlobalSlot() || !this.hasStateSlot(issue.state)) return;
-    if (!issue.id || !issue.identifier || !issue.title || !issue.state || !issue.repository) return;
+    if (!issue.id || !issue.identifier || !issue.title || !issue.state || !issue.repository) {
+      return;
+    }
     if (issue.github_state !== "open") return;
 
     const cfg = this.cfg();
@@ -429,11 +428,7 @@ export class Orchestrator extends EventEmitter {
                   issue: entry.issue,
                   attempt,
                 })
-              : buildContinuationPrompt(
-                  cfg.claude.continuation_prompt,
-                  entry.issue,
-                  attempt,
-                );
+              : buildContinuationPrompt(cfg.claude.continuation_prompt, entry.issue, attempt);
         } catch (e: any) {
           if (e instanceof PromptError) {
             workerExitReason = { error: `${e.code}: ${e.message}` };
@@ -470,7 +465,9 @@ export class Orchestrator extends EventEmitter {
 
         // After successful turn: refresh issue state, possibly continue
         try {
-          const { issues: refreshed } = await this.tracker.fetchIssueStatesByIds([entry.issue_id]);
+          const { issues: refreshed } = await this.tracker.fetchIssueStatesByIds([
+            entry.issue_id,
+          ]);
           if (refreshed.length === 0) {
             return; // issue vanished; exit normally
           }
@@ -589,7 +586,10 @@ export class Orchestrator extends EventEmitter {
   // Advisory usage from `assistant` messages reports cumulative tokens within the
   // current turn. Use max() so we never go backwards if events arrive out of order;
   // these values are reset to 0 when the authoritative `result` lands.
-  private accumulateUsageAdvisory(entry: RunningInternal, u: NonNullable<RuntimeEvent["usage"]>) {
+  private accumulateUsageAdvisory(
+    entry: RunningInternal,
+    u: NonNullable<RuntimeEvent["usage"]>,
+  ) {
     entry.advisory_input_tokens = Math.max(entry.advisory_input_tokens, u.input_tokens ?? 0);
     entry.advisory_output_tokens = Math.max(entry.advisory_output_tokens, u.output_tokens ?? 0);
     entry.advisory_cache_creation_input_tokens = Math.max(
@@ -612,13 +612,7 @@ export class Orchestrator extends EventEmitter {
     if (entry.status === "Succeeded") {
       this.completed.add(entry.issue_id);
       // Continuation retry after ~1s
-      this.scheduleRetry(
-        entry.issue_id,
-        entry.identifier,
-        1,
-        1000,
-        null,
-      );
+      this.scheduleRetry(entry.issue_id, entry.identifier, 1, 1000, null);
     } else {
       const attempt = nextAttempt(entry.retry_attempt);
       const delay = Math.min(10000 * Math.pow(2, attempt - 1), cfg.agent.max_retry_backoff_ms);
@@ -707,7 +701,10 @@ export class Orchestrator extends EventEmitter {
     if (e instanceof TrackerError) {
       log.warn("tracker_error", { code: e.code, label, message: e.message });
       if (e.code === "github_rate_limited" || e.code === "github_secondary_rate_limit") {
-        const cap = Math.min(this.effectivePollIntervalMs * 4, this.cfg().agent.max_retry_backoff_ms);
+        const cap = Math.min(
+          this.effectivePollIntervalMs * 4,
+          this.cfg().agent.max_retry_backoff_ms,
+        );
         this.rateLimitBackoffUntilMs = Date.now() + cap;
       }
     } else {
@@ -731,8 +728,10 @@ export class Orchestrator extends EventEmitter {
       project_id: string | null;
       poll_interval_ms: number;
       max_concurrent_agents: number;
+      max_turns: number;
     };
   } {
+    const maxTurns = this.cfg().agent.max_turns;
     const running = Array.from(this.running.values()).map((r) => {
       const liveIn = r.input_tokens + r.advisory_input_tokens;
       const liveOut = r.output_tokens + r.advisory_output_tokens;
@@ -752,11 +751,13 @@ export class Orchestrator extends EventEmitter {
         session_id: r.session_id,
         claude_pid: r.claude_pid,
         turn_count: r.turn_count,
+        max_turns: maxTurns,
         status: r.status,
         last_event: r.last_event,
         last_message: r.last_message,
         started_at: r.started_at,
         last_event_at: r.last_event_timestamp,
+        error: r.error ?? null,
         tokens: {
           input_tokens: liveIn,
           output_tokens: liveOut,
@@ -796,6 +797,7 @@ export class Orchestrator extends EventEmitter {
         project_id: this.cfg().tracker.project_id ?? null,
         poll_interval_ms: this.effectivePollIntervalMs,
         max_concurrent_agents: this.cfg().agent.max_concurrent_agents,
+        max_turns: maxTurns,
       },
     };
   }

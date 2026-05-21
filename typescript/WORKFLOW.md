@@ -2,7 +2,7 @@
 tracker:
   kind: github
   api_key: $GITHUB_TOKEN
-  repository: jarheghan/social-agent-studio
+  repository: jarheghan/SparkHub
   state_source: labels
   state_label_prefix: "status:"
   active_states: ["Todo", "In Progress","Open"]
@@ -41,7 +41,7 @@ agent:
 
 claude:
   command: claude
-  model: claude-sonnet-4-6
+  model: claude-opus-4-7[1m]
   permission_mode: bypassPermissions
   turn_timeout_ms: 3600000
   read_timeout_ms: 5000
