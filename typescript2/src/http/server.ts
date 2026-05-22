@@ -87,6 +87,9 @@ export class SymphonyHttpServer {
         await this.orchestrator.forceRefresh();
         return sendJson(res, 200, { ok: true });
       }
+      if (url.pathname.startsWith("/api/v1/sessions/") && req.method === "POST") {
+        return await this.handleSessionMutation(url.pathname, req, res);
+      }
       if (url.pathname === "/api/v1/events" && req.method === "GET") {
         return this.handleSse(req, res);
       }
@@ -104,6 +107,58 @@ export class SymphonyHttpServer {
       log.warn("http_handler_error", { error: e?.message, path: url.pathname });
       sendJson(res, 500, { error: e?.message || "internal_error" });
     }
+  }
+
+  /**
+   * `POST /api/v1/sessions/<urlencoded-ident>/pause` (body
+   * `{ "mode": "graceful" | "interrupt" }`, default graceful) and
+   * `POST /api/v1/sessions/<urlencoded-ident>/resume`. 404 = unknown session,
+   * 409 = bad state / no free slot, 403 = mutation auth failed.
+   */
+  private async handleSessionMutation(
+    pathname: string,
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ) {
+    const rest = pathname.slice("/api/v1/sessions/".length);
+    const slash = rest.lastIndexOf("/");
+    if (slash <= 0) return sendJson(res, 404, { error: "not_found" });
+    const ident = decodeURIComponent(rest.slice(0, slash));
+    const action = rest.slice(slash + 1);
+    if (!ident) return sendJson(res, 404, { error: "not_found" });
+
+    const gate = this.checkMutationAuth(req);
+    if (!gate.ok) return sendJson(res, 403, { error: gate.error });
+
+    if (action === "pause") {
+      const body = await readJsonBody(req);
+      const mode = body?.mode === "interrupt" ? "interrupt" : "graceful";
+      const r = this.orchestrator.pauseByIdentifier(ident, mode);
+      if ("error" in r) return sendJson(res, r.error === "not_found" ? 404 : 409, r);
+      return sendJson(res, 200, r);
+    }
+    if (action === "resume") {
+      const r = this.orchestrator.resumeByIdentifier(ident);
+      if ("error" in r) return sendJson(res, r.error === "not_found" ? 404 : 409, r);
+      return sendJson(res, 200, r);
+    }
+    return sendJson(res, 404, { error: "not_found" });
+  }
+
+  /**
+   * Mutation routes are unguarded on a loopback bind. When `--host` is
+   * non-loopback they require an `x-symphony-token` header matching
+   * `SYMPHONY_CONTROL_TOKEN`; if that env var is unset, mutations are refused.
+   */
+  private checkMutationAuth(
+    req: http.IncomingMessage,
+  ): { ok: true } | { ok: false; error: string } {
+    if (isLoopbackHost(this.opts.host)) return { ok: true };
+    const token = process.env.SYMPHONY_CONTROL_TOKEN;
+    if (!token) return { ok: false, error: "control_token_not_configured" };
+    const provided = req.headers["x-symphony-token"];
+    if (typeof provided === "string" && provided === token) return { ok: true };
+    return { ok: false, error: "unauthorized" };
   }
 
   private handleSse(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -180,4 +235,39 @@ async function resolveWebDir(): Promise<string | null> {
 function sendJson(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "Content-Type": MIME[".json"] });
   res.end(JSON.stringify(body, null, 2));
+}
+
+function isLoopbackHost(host: string): boolean {
+  const h = (host || "").toLowerCase();
+  return (
+    h === "localhost" ||
+    h === "::1" ||
+    h === "0:0:0:0:0:0:0:1" ||
+    h.startsWith("127.")
+  );
+}
+
+/** Read and JSON-parse a request body; resolves `{}` on empty / oversized / malformed input. */
+function readJsonBody(req: http.IncomingMessage): Promise<any> {
+  return new Promise((resolve) => {
+    let data = "";
+    let tooBig = false;
+    req.on("data", (c) => {
+      if (tooBig) return;
+      data += c;
+      if (data.length > 1_000_000) {
+        tooBig = true;
+        data = "";
+      }
+    });
+    req.on("end", () => {
+      if (tooBig || !data) return resolve({});
+      try {
+        resolve(JSON.parse(data));
+      } catch {
+        resolve({});
+      }
+    });
+    req.on("error", () => resolve({}));
+  });
 }

@@ -84,6 +84,10 @@ const Icon = {
   coin: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M9.5 9.2A2.6 2.6 0 0 1 12 7.6c1.5 0 2.6.9 2.6 2.1 0 2.7-5.2 1.6-5.2 4.4 0 1.2 1.2 2.1 2.6 2.1 1.3 0 2.2-.6 2.5-1.5"/></svg>`,
   inbox: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.5 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.5A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.7 1.5z"/></svg>`,
   check: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.1V12a10 10 0 1 1-5.9-9.1"/><polyline points="22 4 12 14.1 9 11.1"/></svg>`,
+  pause: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>`,
+  play: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 4 20 12 6 20 6 4"/></svg>`,
+  caret: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`,
+  zap: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`,
 };
 
 /* ------------------------------------------------------------- count-up hook */
@@ -231,11 +235,20 @@ function Stat({ k, v, accent }) {
   `;
 }
 
-function SessionCard({ run, open, onToggle }) {
+function SessionCard({ run, open, onToggle, onPause, busy }) {
   const t = run.tokens || {};
   const stateCls = /progress/i.test(run.state || "") ? " s-progress" : "";
   const cat = eventClass(run.last_event);
   const events = (run.events || []).slice().reverse();
+  const [menuOpen, setMenuOpen] = useState(false);
+  // Close the interrupt menu on any outside click.
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = () => setMenuOpen(false);
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, [menuOpen]);
+  const pausing = /pausing|paused/i.test(run.status || "");
   return html`
     <div class=${"card session" + (open ? " open" : "")}>
       <div class="session-head" onClick=${onToggle}>
@@ -299,6 +312,46 @@ function SessionCard({ run, open, onToggle }) {
           : null}
       </div>
 
+      <div class="session-actions" onClick=${(e) => e.stopPropagation()}>
+        ${pausing
+          ? html`<span class="pausing-note">${Icon.pause}<span>pause requested — stopping…</span></span>`
+          : html`<div class="split-btn">
+              <button
+                class="btn-sm"
+                disabled=${busy}
+                onClick=${() => onPause(run.issue_identifier, "graceful")}
+                title="Finish the in-flight turn, then hold"
+              >
+                ${Icon.pause}<span>Pause</span>
+              </button>
+              <button
+                class=${"btn-sm caret" + (menuOpen ? " active" : "")}
+                disabled=${busy}
+                onClick=${() => setMenuOpen((o) => !o)}
+                title="More pause options"
+              >
+                ${Icon.caret}
+              </button>
+              ${menuOpen
+                ? html`<div class="pause-menu">
+                    <button
+                      class="pause-menu-item"
+                      onClick=${() => {
+                        setMenuOpen(false);
+                        onPause(run.issue_identifier, "interrupt");
+                      }}
+                    >
+                      ${Icon.zap}
+                      <span>
+                        <b>Interrupt now</b>
+                        <small>kill the turn — partial work is discarded</small>
+                      </span>
+                    </button>
+                  </div>`
+                : null}
+            </div>`}
+      </div>
+
       ${open
         ? html`<div class="detail">
             <div class="detail-title">
@@ -334,6 +387,120 @@ function SessionCard({ run, open, onToggle }) {
             ${run.error
               ? html`<div class="err-banner">${run.error}</div>`
               : null}
+            <div class="ws-path"><b>workspace</b> · ${run.workspace_path || "—"}</div>
+          </div>`
+        : null}
+    </div>
+  `;
+}
+
+function PausedCard({ run, open, onToggle, onResume, busy }) {
+  const t = run.tokens || {};
+  const stateCls = /progress/i.test(run.state || "") ? " s-progress" : "";
+  const events = (run.events || []).slice().reverse();
+  return html`
+    <div class=${"card session is-paused" + (open ? " open" : "")}>
+      <div class="session-head" onClick=${onToggle}>
+        <div class="session-main">
+          <div class="ident-row">
+            <span class="ident">${run.issue_identifier}</span>
+            <span class="pill paused-pill">${Icon.pause}<span>paused</span></span>
+            <span class=${"pill state" + stateCls}>${run.state || "—"}</span>
+            ${run.priority != null
+              ? html`<span class="pill prio">P${run.priority}</span>`
+              : null}
+            ${run.url
+              ? html`<a
+                  class="gh-link"
+                  href=${run.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick=${(e) => e.stopPropagation()}
+                  >${Icon.ext}github</a
+                >`
+              : null}
+          </div>
+          <div class="session-title">${run.title || "(untitled issue)"}</div>
+          ${run.labels && run.labels.length
+            ? html`<div class="labels">
+                ${run.labels.slice(0, 7).map(
+                  (l) => html`<span class="chip" key=${l}>${l}</span>`,
+                )}
+                ${run.labels.length > 7
+                  ? html`<span class="chip">+${run.labels.length - 7}</span>`
+                  : null}
+              </div>`
+            : null}
+        </div>
+        <${TurnRing} turn=${run.turn_count} max=${run.max_turns || 1} />
+      </div>
+
+      <div class="session-stats">
+        <${Stat} k="Status" v="Paused" accent=${true} />
+        <${Stat} k="Pause mode" v=${run.paused_reason || "—"} />
+        <${Stat} k="Session" v=${run.session_id ? run.session_id.slice(0, 8) : "fresh"} />
+        <${Stat} k="Paused" v=${fmtRelative(run.paused_at)} />
+        <${Stat} k="Resumes at" v=${"turn " + (run.resume_start_turn || 1)} />
+      </div>
+
+      <div class="tokens">
+        <div class="tokens-top">
+          <div class="tokens-total">
+            <span class="grad">${fmtNum(t.total_tokens || 0)}</span> tokens
+          </div>
+          <div class="tokens-cost">${fmtCost(run.cost_usd)}</div>
+        </div>
+        <${TokenBar} tokens=${t} />
+      </div>
+
+      <div class="session-actions" onClick=${(e) => e.stopPropagation()}>
+        <button
+          class="btn-sm resume"
+          disabled=${busy}
+          onClick=${() => onResume(run.issue_identifier)}
+          title="Re-enter the per-turn loop via --resume"
+        >
+          ${Icon.play}<span>Resume</span>
+        </button>
+        <span class="paused-hint">
+          ${run.session_id
+            ? "continues session " + run.session_id.slice(0, 8) + " via --resume"
+            : "no session captured — resume restarts fresh"}
+        </span>
+      </div>
+
+      ${open
+        ? html`<div class="detail">
+            <div class="detail-title">
+              <span>Event stream</span>
+              <span>${events.length} events</span>
+            </div>
+            <div class="stream">
+              ${events.length === 0
+                ? html`<div class="empty mini">
+                    <div class="e-sub">No events captured yet.</div>
+                  </div>`
+                : events.map((ev, i) => {
+                    const detail = ev.payload
+                      ? Object.entries(ev.payload)
+                          .filter(([k]) => k !== "stderr" && k !== "tools")
+                          .map(
+                            ([k, v]) =>
+                              `${k}=${
+                                typeof v === "string"
+                                  ? v.slice(0, 70)
+                                  : JSON.stringify(v).slice(0, 70)
+                              }`,
+                          )
+                          .join("  ")
+                      : "";
+                    return html`<div class="ev" key=${i}>
+                      <span class="ev-t">${fmtTime(ev.timestamp)}</span>
+                      <span class=${"ev-n " + eventClass(ev.event)}>${ev.event}</span>
+                      <span class="ev-d">${detail}</span>
+                    </div>`;
+                  })}
+            </div>
             <div class="ws-path"><b>workspace</b> · ${run.workspace_path || "—"}</div>
           </div>`
         : null}
@@ -444,6 +611,8 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [open, setOpen] = useState({});
   const [refreshing, setRefreshing] = useState(false);
+  const [busy, setBusy] = useState({});
+  const [toast, setToast] = useState(null);
   const [, force] = useState(0);
 
   // 1s heartbeat so relative timers stay fresh
@@ -498,8 +667,57 @@ function App() {
     setTimeout(() => setRefreshing(false), 700);
   };
 
+  // Auto-dismiss toasts.
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 4600);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  const sessionAction = async (ident, action, body) => {
+    setBusy((b) => ({ ...b, [ident]: true }));
+    try {
+      const res = await fetch(
+        `/api/v1/sessions/${encodeURIComponent(ident)}/${action}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: body ? JSON.stringify(body) : undefined,
+        },
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const err = data && data.error;
+        const msg =
+          err === "no_slot"
+            ? `Can't resume ${ident} — no free agent slot. It stays paused.`
+            : err === "not_found"
+            ? `${ident} is no longer an active session.`
+            : `${action} failed for ${ident}: ${err || res.status}`;
+        setToast({ msg, kind: "err", id: Date.now() });
+      } else if (action === "pause") {
+        const verb = body && body.mode === "interrupt" ? "Interrupting" : "Pausing";
+        setToast({ msg: `${verb} ${ident}…`, kind: "ok", id: Date.now() });
+      } else if (action === "resume") {
+        setToast({ msg: `Resuming ${ident}…`, kind: "ok", id: Date.now() });
+      }
+    } catch {
+      setToast({
+        msg: `${action} failed for ${ident}: network error`,
+        kind: "err",
+        id: Date.now(),
+      });
+    } finally {
+      setBusy((b) => ({ ...b, [ident]: false }));
+    }
+  };
+
+  const onPause = (ident, mode) => sessionAction(ident, "pause", { mode });
+  const onResume = (ident) => sessionAction(ident, "resume");
+
   const running = snap?.running || [];
   const retrying = snap?.retrying || [];
+  const pausedSessions = snap?.paused || [];
   const totals = snap?.claude_totals;
   const wf = snap?.workflow;
   const rate = snap?.tracker_rate_limits;
@@ -551,7 +769,11 @@ function App() {
             grad=${true}
             meter=${snap ? running.length / Math.max(1, wf?.max_concurrent_agents || 1) : null}
             foot=${snap
-              ? html`<b>${wf?.max_concurrent_agents ?? "—"}</b> concurrent max`
+              ? html`<b>${wf?.max_concurrent_agents ?? "—"}</b> concurrent max${
+                  pausedSessions.length > 0
+                    ? html` · <b>${pausedSessions.length}</b> paused`
+                    : ""
+                }`
               : "connecting…"}
           />
           <${Metric}
@@ -611,9 +833,31 @@ function App() {
                       open=${!!open[r.issue_id]}
                       onToggle=${() =>
                         setOpen((p) => ({ ...p, [r.issue_id]: !p[r.issue_id] }))}
+                      onPause=${onPause}
+                      busy=${!!busy[r.issue_identifier]}
                     />`,
                   )}
                 </div>`}
+
+            ${pausedSessions.length > 0
+              ? html`<div class="col-head paused-head">
+                    <h2>Paused sessions</h2>
+                    <span class="tally">${pausedSessions.length} held</span>
+                  </div>
+                  <div class="sessions">
+                    ${pausedSessions.map(
+                      (r) => html`<${PausedCard}
+                        key=${r.issue_id}
+                        run=${r}
+                        open=${!!open[r.issue_id]}
+                        onToggle=${() =>
+                          setOpen((p) => ({ ...p, [r.issue_id]: !p[r.issue_id] }))}
+                        onResume=${onResume}
+                        busy=${!!busy[r.issue_identifier]}
+                      />`,
+                    )}
+                  </div>`
+              : null}
           </div>
 
           <aside class="rail">
@@ -637,6 +881,20 @@ function App() {
             : "awaiting first snapshot…"}</span
         >
       </footer>
+
+      ${toast
+        ? html`<div class=${"toast " + (toast.kind || "")} key=${toast.id}>
+            <span class="toast-dot"></span>
+            <span class="toast-msg">${toast.msg}</span>
+            <button
+              class="toast-x"
+              onClick=${() => setToast(null)}
+              aria-label="Dismiss"
+            >
+              ×
+            </button>
+          </div>`
+        : null}
     </div>
   `;
 }

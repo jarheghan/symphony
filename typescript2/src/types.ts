@@ -124,6 +124,7 @@ export type RunAttemptStatus =
   | "Failed"
   | "TimedOut"
   | "Stalled"
+  | "Paused"
   | "CanceledByReconciliation";
 
 export interface LiveSession {
@@ -156,6 +157,34 @@ export interface RunningEntry extends LiveSession {
   started_at: string;
   error?: string;
   events: RuntimeEvent[]; // recent events (bounded)
+}
+
+/**
+ * A frozen snapshot of an interrupted session, held until an operator resumes
+ * it. Carries everything `dispatchResume` needs to re-enter the per-turn loop
+ * with `--resume <session_id>` (or, when `session_id` is null, a fresh start).
+ */
+export interface PausedEntry {
+  issue_id: string;
+  identifier: string;
+  issue: Issue;
+  session_id: string | null;
+  workspace_path: string;
+  /** Turn the resumed per-turn loop should re-enter at. */
+  resume_start_turn: number;
+  turn_count: number;
+  retry_attempt: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  total_tokens: number;
+  total_cost_usd: number;
+  events: RuntimeEvent[];
+  started_at: string;
+  paused_at: string;
+  /** "graceful" | "interrupt" — how the pause was requested. */
+  paused_reason: string;
 }
 
 export interface RetryEntry {

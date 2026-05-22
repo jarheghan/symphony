@@ -8,6 +8,7 @@ import { log } from "../logging/logger.js";
 import type {
   ClaudeTotals,
   Issue,
+  PausedEntry,
   RateLimitSnapshot,
   RetryEntry,
   RunningEntry,
@@ -30,11 +31,20 @@ interface RunningInternal extends RunningEntry {
   advisory_output_tokens: number;
   advisory_cache_creation_input_tokens: number;
   advisory_cache_read_input_tokens: number;
+  // Pause control. `graceful` is checked at turn boundaries; `immediate` aborts
+  // the worker with reason "pause". `pauseStartTurn` records the turn a resumed
+  // run should re-enter the per-turn loop at.
+  pauseIntent: "graceful" | "immediate" | null;
+  pauseStartTurn: number | null;
 }
 
 export class Orchestrator extends EventEmitter {
   // Authoritative in-memory state (Section 4.1.8)
   private running = new Map<string, RunningInternal>();
+  // Interrupted sessions held for later resume (Section: Pause / Resume).
+  // A paused issue stays in `claimed` so the poll loop won't re-dispatch it,
+  // but holds no worker, no retry timer, and no concurrency slot.
+  private paused = new Map<string, PausedEntry>();
   private claimed = new Set<string>();
   private retry_attempts = new Map<string, RetryEntry & { timer: NodeJS.Timeout | null }>();
   private completed = new Set<string>();
@@ -187,8 +197,10 @@ export class Orchestrator extends EventEmitter {
         }
       }
     }
-    // Tracker state refresh
-    const ids = Array.from(this.running.keys());
+    // Tracker state refresh — covers both running and paused issues.
+    const runningIds = Array.from(this.running.keys());
+    const pausedIds = Array.from(this.paused.keys());
+    const ids = [...runningIds, ...pausedIds];
     if (ids.length === 0) return;
     let refreshed;
     try {
@@ -203,7 +215,7 @@ export class Orchestrator extends EventEmitter {
     const cfg = this.cfg();
     const termLower = new Set(cfg.tracker.terminal_states.map((s) => s.toLowerCase()));
     const activeLower = new Set(cfg.tracker.active_states.map((s) => s.toLowerCase()));
-    for (const id of ids) {
+    for (const id of runningIds) {
       const refreshedIssue = byId.get(id);
       const runEntry = this.running.get(id);
       if (!runEntry) continue;
@@ -230,6 +242,37 @@ export class Orchestrator extends EventEmitter {
           state: refreshedIssue.state,
         });
         runEntry.workerAbort.abort("non_active");
+      }
+    }
+    // Paused sweep: a paused issue that went terminal / closed is discarded and
+    // its workspace cleaned; one that went non-active is discarded without
+    // cleanup. An issue that vanished is left paused.
+    for (const id of pausedIds) {
+      const refreshedIssue = byId.get(id);
+      const pausedEntry = this.paused.get(id);
+      if (!pausedEntry) continue;
+      if (!refreshedIssue) continue; // missing — keep paused for now
+      const stateLower = (refreshedIssue.state || "").toLowerCase();
+      if (refreshedIssue.github_state === "closed" || termLower.has(stateLower)) {
+        log.info("reconcile_discard_paused_with_cleanup", {
+          issue_id: id,
+          issue_identifier: refreshedIssue.identifier,
+          state: refreshedIssue.state,
+        });
+        this.paused.delete(id);
+        this.claimed.delete(id);
+        this.workspaceManager
+          .removeForIssue(refreshedIssue.identifier, cfg.hooks)
+          .catch(() => {});
+      } else if (activeLower.has(stateLower)) {
+        pausedEntry.issue = refreshedIssue;
+      } else {
+        log.info("reconcile_discard_paused_no_cleanup", {
+          issue_id: id,
+          state: refreshedIssue.state,
+        });
+        this.paused.delete(id);
+        this.claimed.delete(id);
       }
     }
   }
@@ -349,6 +392,8 @@ export class Orchestrator extends EventEmitter {
       advisory_output_tokens: 0,
       advisory_cache_creation_input_tokens: 0,
       advisory_cache_read_input_tokens: 0,
+      pauseIntent: null,
+      pauseStartTurn: null,
     };
     this.running.set(issue.id, entry);
     log.info("dispatch_started", {
@@ -368,9 +413,160 @@ export class Orchestrator extends EventEmitter {
       });
   }
 
-  private async runAttempt(entry: RunningInternal, attempt: number | null): Promise<void> {
+  /**
+   * Re-enter the per-turn loop for a paused session. Reuses the preserved
+   * workspace and `--resume <session_id>` continuity; seeds token / cost
+   * counters and the start turn from the paused snapshot. The issue is already
+   * in `claimed` (it stayed claimed through the pause).
+   */
+  private dispatchResume(paused: PausedEntry): void {
+    const retry = this.retry_attempts.get(paused.issue_id);
+    if (retry?.timer) clearTimeout(retry.timer);
+    this.retry_attempts.delete(paused.issue_id);
+    this.claimed.add(paused.issue_id);
+
+    const abort = new AbortController();
+    const entry: RunningInternal = {
+      issue_id: paused.issue_id,
+      identifier: paused.identifier,
+      issue: paused.issue,
+      workspace_path: paused.workspace_path,
+      status: "PreparingWorkspace",
+      retry_attempt: paused.retry_attempt,
+      started_at: new Date().toISOString(),
+      session_id: paused.session_id,
+      thread_id: paused.session_id,
+      turn_id: paused.session_id ? `${paused.session_id}-${paused.resume_start_turn}` : null,
+      claude_pid: null,
+      last_event: null,
+      last_event_timestamp: null,
+      last_message: null,
+      input_tokens: paused.input_tokens,
+      output_tokens: paused.output_tokens,
+      cache_creation_input_tokens: paused.cache_creation_input_tokens,
+      cache_read_input_tokens: paused.cache_read_input_tokens,
+      total_tokens: paused.total_tokens,
+      last_reported_input_tokens: 0,
+      last_reported_output_tokens: 0,
+      last_reported_total_tokens: 0,
+      turn_count: paused.turn_count,
+      total_cost_usd: paused.total_cost_usd,
+      events: paused.events.slice(),
+      workerAbort: abort,
+      workerPromise: Promise.resolve(),
+      advisory_input_tokens: 0,
+      advisory_output_tokens: 0,
+      advisory_cache_creation_input_tokens: 0,
+      advisory_cache_read_input_tokens: 0,
+      pauseIntent: null,
+      pauseStartTurn: null,
+    };
+    this.running.set(paused.issue_id, entry);
+    log.info("session_resumed", {
+      issue_id: paused.issue_id,
+      issue_identifier: paused.identifier,
+      session_id: paused.session_id,
+      start_turn: paused.resume_start_turn,
+    });
+    this.emit("agent_event", {
+      issue_id: paused.issue_id,
+      event: {
+        event: "session_resumed",
+        timestamp: new Date().toISOString(),
+        payload: { session_id: paused.session_id, start_turn: paused.resume_start_turn },
+      },
+    });
+    this.emit("snapshot", this.snapshot());
+
+    entry.workerPromise = this.runAttempt(entry, paused.retry_attempt, {
+      sessionId: paused.session_id,
+      startTurn: paused.resume_start_turn,
+    })
+      .catch((e: any) => {
+        log.error("worker_unhandled", { error: e?.message, issue_id: paused.issue_id });
+      })
+      .finally(() => {
+        this.afterWorkerExit(entry);
+      });
+  }
+
+  /**
+   * Pause a running session. `graceful` finishes the in-flight turn then stops
+   * before the next; `interrupt` kills the `claude` subprocess immediately.
+   * Idempotent: re-pausing a session that is already pausing / paused is a
+   * no-op. Returns `{ ok, status }` or `{ error }`.
+   */
+  pauseByIdentifier(
+    identifier: string,
+    mode: "graceful" | "interrupt",
+  ): { ok: true; status: string } | { error: string } {
+    const entry = this.findRunningByIdentifier(identifier);
+    if (!entry) {
+      for (const p of this.paused.values()) {
+        if (p.identifier === identifier) return { ok: true, status: "Paused" };
+      }
+      return { error: "not_found" };
+    }
+    if (mode === "interrupt") {
+      entry.pauseIntent = "immediate";
+      if (!entry.workerAbort.signal.aborted) entry.workerAbort.abort("pause");
+    } else {
+      // Don't downgrade an already-requested immediate pause.
+      if (entry.pauseIntent !== "immediate") entry.pauseIntent = "graceful";
+    }
+    log.info("pause_requested", {
+      issue_id: entry.issue_id,
+      issue_identifier: identifier,
+      mode,
+    });
+    this.emit("snapshot", this.snapshot());
+    return { ok: true, status: "Pausing" };
+  }
+
+  /**
+   * Resume a paused session. Fails with `no_slot` if no global / per-state
+   * concurrency slot is free (the session stays paused). Idempotent for a
+   * session that is already running. Returns `{ ok, status }` or `{ error }`.
+   */
+  resumeByIdentifier(
+    identifier: string,
+  ): { ok: true; status: string } | { error: string } {
+    let issueId: string | null = null;
+    for (const [id, p] of this.paused) {
+      if (p.identifier === identifier) {
+        issueId = id;
+        break;
+      }
+    }
+    if (!issueId) {
+      if (this.findRunningByIdentifier(identifier)) return { ok: true, status: "Running" };
+      return { error: "not_found" };
+    }
+    const paused = this.paused.get(issueId)!;
+    if (!this.hasGlobalSlot() || !this.hasStateSlot(paused.issue.state)) {
+      return { error: "no_slot" };
+    }
+    this.paused.delete(issueId);
+    this.dispatchResume(paused);
+    return { ok: true, status: "Running" };
+  }
+
+  /**
+   * Whether a graceful pause has been requested for a running entry. Wrapped in
+   * a method so the read isn't subject to control-flow narrowing inside the
+   * per-turn loop — `pauseIntent` is mutated asynchronously by `pauseByIdentifier`.
+   */
+  private gracefulPauseRequested(entry: RunningInternal): boolean {
+    return entry.pauseIntent === "graceful";
+  }
+
+  private async runAttempt(
+    entry: RunningInternal,
+    attempt: number | null,
+    resume?: { sessionId: string | null; startTurn: number },
+  ): Promise<void> {
     const cfg = this.cfg();
-    let workerExitReason: "normal" | { error: string } = "normal";
+    let workerExitReason: "normal" | "paused" | { error: string } = "normal";
     let workspaceAvailableForAfterRun = false;
     try {
       // Workspace creation
@@ -395,7 +591,10 @@ export class Orchestrator extends EventEmitter {
           return;
         }
       }
-      if (cfg.hooks.before_run) {
+      // On resume, `before_run` is skipped: re-running it (typically a
+      // `git checkout -B …`) would clobber the branch state the paused session
+      // left in progress. The original `before_run` ran at first dispatch.
+      if (!resume && cfg.hooks.before_run) {
         const r = await runHook(
           "before_run",
           cfg.hooks.before_run,
@@ -410,12 +609,26 @@ export class Orchestrator extends EventEmitter {
       }
 
       // Per-turn loop
-      let turnNumber = 1;
-      let sessionId: string | null = null;
+      let turnNumber = resume ? resume.startTurn : 1;
+      let sessionId: string | null = resume ? resume.sessionId : null;
       const maxTurns = cfg.agent.max_turns;
       while (true) {
+        // Graceful pause requested — stop cleanly at this turn boundary before
+        // launching the next turn.
+        if (this.gracefulPauseRequested(entry)) {
+          entry.pauseStartTurn = turnNumber;
+          workerExitReason = "paused";
+          return;
+        }
         if (entry.workerAbort.signal.aborted) {
-          workerExitReason = { error: `cancelled: ${entry.workerAbort.signal.reason}` };
+          // An interrupt-mode pause aborts the worker with reason "pause";
+          // treat that as a pause, not a failure.
+          if (entry.workerAbort.signal.reason === "pause") {
+            entry.pauseStartTurn = turnNumber;
+            workerExitReason = "paused";
+          } else {
+            workerExitReason = { error: `cancelled: ${entry.workerAbort.signal.reason}` };
+          }
           return;
         }
         entry.status = "BuildingPrompt";
@@ -459,6 +672,14 @@ export class Orchestrator extends EventEmitter {
           this.accumulateUsage(entry, result.usage);
         }
         if (!result.ok) {
+          // Interrupt-mode pause kills the subprocess mid-turn. The partial
+          // turn's work is discarded; a resume re-runs this turn from the last
+          // commit recovered via `--resume`.
+          if (entry.workerAbort.signal.aborted && entry.workerAbort.signal.reason === "pause") {
+            entry.pauseStartTurn = turnNumber;
+            workerExitReason = "paused";
+            return;
+          }
           workerExitReason = { error: result.error || result.result_subtype || "turn_failed" };
           return;
         }
@@ -481,14 +702,31 @@ export class Orchestrator extends EventEmitter {
           workerExitReason = { error: `issue_state_refresh: ${e.message}` };
           return;
         }
+        // `max_turns` completion wins over a pause at the same boundary — the
+        // session is effectively done.
         if (turnNumber >= maxTurns) return;
+        // Graceful pause requested — the just-completed turn is committed;
+        // resume continues from the next turn.
+        if (this.gracefulPauseRequested(entry)) {
+          entry.pauseStartTurn = turnNumber + 1;
+          workerExitReason = "paused";
+          return;
+        }
         turnNumber++;
       }
     } catch (e: any) {
       workerExitReason = { error: e?.message || "worker exception" };
     } finally {
-      // after_run hook best effort
-      if (workspaceAvailableForAfterRun && entry.workspace_path && this.cfg().hooks.after_run) {
+      const paused = workerExitReason === "paused";
+      // after_run hook best effort. Skipped on pause: it is the symmetric
+      // counterpart of the `before_run` skipped on resume, so a paused/resumed
+      // run still gets exactly one before_run / after_run pair.
+      if (
+        !paused &&
+        workspaceAvailableForAfterRun &&
+        entry.workspace_path &&
+        this.cfg().hooks.after_run
+      ) {
         await runHookBestEffort(
           "after_run",
           this.cfg().hooks.after_run as string,
@@ -497,8 +735,14 @@ export class Orchestrator extends EventEmitter {
           this.cfg().hooks.timeout_ms,
         );
       }
-      entry.status = workerExitReason === "normal" ? "Succeeded" : "Failed";
-      if (workerExitReason !== "normal") entry.error = workerExitReason.error;
+      if (workerExitReason === "normal") {
+        entry.status = "Succeeded";
+      } else if (workerExitReason === "paused") {
+        entry.status = "Paused";
+      } else {
+        entry.status = "Failed";
+        entry.error = workerExitReason.error;
+      }
     }
   }
 
@@ -529,6 +773,9 @@ export class Orchestrator extends EventEmitter {
         break;
       case "turn_cancelled":
         entry.status = "CanceledByReconciliation";
+        break;
+      case "turn_paused":
+        entry.status = "Paused";
         break;
     }
     if (event.payload) {
@@ -604,11 +851,60 @@ export class Orchestrator extends EventEmitter {
 
   private afterWorkerExit(entry: RunningInternal): void {
     const wasRunning = this.running.delete(entry.issue_id);
-    this.claimed.delete(entry.issue_id);
-    if (!wasRunning) return;
+    if (!wasRunning) {
+      this.claimed.delete(entry.issue_id);
+      return;
+    }
     const runtimeSec = (Date.now() - Date.parse(entry.started_at)) / 1000;
     this.claude_totals.seconds_running += runtimeSec;
     const cfg = this.cfg();
+
+    // Paused: hold a resume snapshot, keep the issue claimed (so the poll loop
+    // won't re-dispatch it), schedule no retry, and leave the workspace intact.
+    if (entry.status === "Paused") {
+      const pausedReason = entry.pauseIntent === "immediate" ? "interrupt" : "graceful";
+      const pausedEntry: PausedEntry = {
+        issue_id: entry.issue_id,
+        identifier: entry.identifier,
+        issue: entry.issue,
+        session_id: entry.session_id,
+        workspace_path: entry.workspace_path,
+        resume_start_turn: entry.pauseStartTurn ?? Math.max(1, entry.turn_count),
+        turn_count: entry.turn_count,
+        retry_attempt: entry.retry_attempt,
+        input_tokens: entry.input_tokens,
+        output_tokens: entry.output_tokens,
+        cache_creation_input_tokens: entry.cache_creation_input_tokens,
+        cache_read_input_tokens: entry.cache_read_input_tokens,
+        total_tokens: entry.total_tokens,
+        total_cost_usd: entry.total_cost_usd,
+        events: entry.events.slice(),
+        started_at: entry.started_at,
+        paused_at: new Date().toISOString(),
+        paused_reason: pausedReason,
+      };
+      this.paused.set(entry.issue_id, pausedEntry);
+      log.info("session_paused", {
+        issue_id: entry.issue_id,
+        issue_identifier: entry.identifier,
+        session_id: entry.session_id,
+        reason: pausedReason,
+        resume_start_turn: pausedEntry.resume_start_turn,
+        runtime_seconds: runtimeSec.toFixed(1),
+      });
+      this.emit("agent_event", {
+        issue_id: entry.issue_id,
+        event: {
+          event: "session_paused",
+          timestamp: pausedEntry.paused_at,
+          payload: { reason: pausedReason, resume_start_turn: pausedEntry.resume_start_turn },
+        },
+      });
+      this.emit("snapshot", this.snapshot());
+      return;
+    }
+
+    this.claimed.delete(entry.issue_id);
     if (entry.status === "Succeeded") {
       this.completed.add(entry.issue_id);
       // Continuation retry after ~1s
@@ -715,9 +1011,10 @@ export class Orchestrator extends EventEmitter {
   snapshot(): {
     generated_at: string;
     started_at: string;
-    counts: { running: number; retrying: number };
+    counts: { running: number; retrying: number; paused: number };
     running: any[];
     retrying: any[];
+    paused: any[];
     claude_totals: ClaudeTotals;
     tracker_rate_limits: RateLimitSnapshot | null;
     claude_rate_limits: RateLimitSnapshot | null;
@@ -781,12 +1078,49 @@ export class Orchestrator extends EventEmitter {
       due_at: r.due_at,
       error: r.error,
     }));
+    const paused = Array.from(this.paused.values()).map((p) => {
+      const inn = p.input_tokens;
+      const out = p.output_tokens;
+      const cc = p.cache_creation_input_tokens;
+      const cr = p.cache_read_input_tokens;
+      return {
+        issue_id: p.issue_id,
+        issue_identifier: p.identifier,
+        repository: p.issue.repository,
+        title: p.issue.title,
+        url: p.issue.url,
+        state: p.issue.state,
+        priority: p.issue.priority,
+        labels: p.issue.labels,
+        assignees: p.issue.assignees,
+        session_id: p.session_id,
+        turn_count: p.turn_count,
+        max_turns: maxTurns,
+        status: "Paused" as const,
+        resume_start_turn: p.resume_start_turn,
+        paused_at: p.paused_at,
+        paused_reason: p.paused_reason,
+        started_at: p.started_at,
+        tokens: {
+          input_tokens: inn,
+          output_tokens: out,
+          cache_creation_input_tokens: cc,
+          cache_read_input_tokens: cr,
+          total_tokens: inn + out + cc + cr,
+          live: false,
+        },
+        cost_usd: p.total_cost_usd,
+        events: p.events.slice(-30),
+        workspace_path: p.workspace_path,
+      };
+    });
     return {
       generated_at: new Date().toISOString(),
       started_at: this.startedAt,
-      counts: { running: running.length, retrying: retrying.length },
+      counts: { running: running.length, retrying: retrying.length, paused: paused.length },
       running,
       retrying,
+      paused,
       claude_totals: this.claude_totals,
       tracker_rate_limits: this.tracker_rate_limits,
       claude_rate_limits: this.claude_rate_limits,

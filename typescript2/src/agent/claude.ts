@@ -197,7 +197,12 @@ export async function runTurn(ctx: TurnContext): Promise<TurnResult> {
   if (ctx.cancelSignal) {
     ctx.cancelSignal.addEventListener("abort", () => {
       cancelled = true;
-      emit("turn_cancelled", { reason: ctx.cancelSignal?.reason ?? "reconciliation" });
+      const reason = ctx.cancelSignal?.reason;
+      // An interrupt-mode pause aborts with reason "pause"; label the event
+      // `turn_paused` (vs `turn_cancelled`) for cleaner observability.
+      emit(reason === "pause" ? "turn_paused" : "turn_cancelled", {
+        reason: reason ?? "reconciliation",
+      });
       killSubtree("SIGTERM");
       setTimeout(() => killSubtree("SIGKILL"), 2000);
     });

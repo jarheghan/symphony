@@ -80,6 +80,8 @@ Environment:
   GITHUB_TOKEN         Default GitHub auth token (referenced via $GITHUB_TOKEN in WORKFLOW.md)
   ANTHROPIC_API_KEY    Claude Code auth (forwarded to the subprocess)
   SYMPHONY_POWERSHELL  Override the PowerShell executable (defaults: pwsh, then powershell.exe)
+  SYMPHONY_CONTROL_TOKEN  Shared secret required on pause/resume routes when --host is non-loopback
+                          (sent as the x-symphony-token header)
 
 Automatic .env loading (highest priority first):
   <workflow-dir>/.env.local
