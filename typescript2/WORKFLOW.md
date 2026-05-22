@@ -37,12 +37,26 @@ hooks:
     git config user.email "symphony-bot@users.noreply.github.com"
     git config user.name  "Symphony Bot"
 
-  # Runs before every Claude Code attempt — refresh and branch off the default.
+  # Runs before every Claude Code attempt. Always start from a clean tree
+  # (a previous run may have left uncommitted work, which would otherwise block
+  # `git checkout`). If the PR branch already exists on the remote, continue it
+  # so work accumulates across runs; otherwise branch off the default.
   before_run: |
     git fetch origin
-    $head = git symbolic-ref --quiet --short refs/remotes/origin/HEAD
-    if (-not $head) { $head = "origin/main" }
-    git checkout -B "symphony/$($env:SYMPHONY_ISSUE_BRANCH_NAME)" $head
+    git reset --hard
+    git clean -fd
+    $branch = "symphony/$($env:SYMPHONY_ISSUE_BRANCH_NAME)"
+    if (git ls-remote --heads origin $branch) {
+      # `after_create` clones with --depth=1, which implies --single-branch:
+      # `git fetch origin` only updates origin/<default> and never creates an
+      # origin/$branch ref. Fetch the branch by name and branch off FETCH_HEAD.
+      git fetch origin $branch
+      git checkout -B $branch FETCH_HEAD
+    } else {
+      $head = git symbolic-ref --quiet --short refs/remotes/origin/HEAD
+      if (-not $head) { $head = "origin/main" }
+      git checkout -B $branch $head
+    }
 
   # Runs after every attempt (best effort — failures are logged and ignored).
   after_run: |

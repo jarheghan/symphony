@@ -540,6 +540,19 @@ body::after {
   background: rgba(243, 185, 100, 0.1);
   color: #f6cd92;
 }
+.pill.pr-conflict {
+  border-color: rgba(248, 122, 155, 0.45);
+  background: rgba(248, 122, 155, 0.12);
+  color: #f7a8bd;
+}
+.pill.pr-conflict svg {
+  width: 10px;
+  height: 10px;
+}
+.pill.pr-conflict:hover {
+  border-color: rgba(248, 122, 155, 0.7);
+  background: rgba(248, 122, 155, 0.18);
+}
 .gh-link {
   display: inline-flex;
   align-items: center;

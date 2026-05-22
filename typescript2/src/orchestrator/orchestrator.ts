@@ -7,24 +7,66 @@ import { EventEmitter } from "node:events";
 import { log } from "../logging/logger.js";
 import type {
   ClaudeTotals,
+  HooksConfig,
   Issue,
+  LinkedPullRequest,
   PausedEntry,
   RateLimitSnapshot,
   RetryEntry,
   RunningEntry,
   RuntimeEvent,
   ServiceConfig,
+  Workspace,
   WorkflowDefinition,
 } from "../types.js";
 import { GitHubTracker, TrackerError } from "../tracker/github.js";
 import { WorkspaceManager, hookEnv, runHook, runHookBestEffort } from "../workspace/manager.js";
 import { runTurn, validateAddDirs } from "../agent/claude.js";
-import { buildContinuationPrompt, renderPrompt, PromptError } from "../prompt/render.js";
+import type { TurnContext, TurnResult } from "../agent/claude.js";
+import {
+  buildConflictDirective,
+  buildContinuationPrompt,
+  renderPrompt,
+  PromptError,
+} from "../prompt/render.js";
 import { validateDispatchConfig } from "../workflow/config.js";
+
+/** Tracker surface the orchestrator depends on — satisfied by {@link GitHubTracker}. */
+export interface TrackerLike {
+  fetchCandidateIssues(): Promise<{ issues: Issue[]; rate: RateLimitSnapshot }>;
+  fetchIssueStatesByIds(
+    ids: string[],
+  ): Promise<{ issues: Issue[]; rate: RateLimitSnapshot }>;
+  fetchIssuesByStates(
+    states: string[],
+  ): Promise<{ issues: Issue[]; rate: RateLimitSnapshot }>;
+  fetchOpenPullRequestForBranch(
+    repository: string,
+    headRefName: string,
+  ): Promise<LinkedPullRequest | null>;
+}
+
+/** Workspace surface the orchestrator depends on — satisfied by {@link WorkspaceManager}. */
+export interface WorkspaceManagerLike {
+  createForIssue(identifier: string): Promise<Workspace>;
+  removeForIssue(identifier: string, hooks: HooksConfig): Promise<void>;
+  removeWorkspacePath(workspacePath: string): Promise<void>;
+}
+
+export type RunTurnFn = (ctx: TurnContext) => Promise<TurnResult>;
+
+/** Injectable collaborators — production uses the real implementations; tests pass fakes. */
+export interface OrchestratorDeps {
+  tracker?: TrackerLike;
+  workspaceManager?: WorkspaceManagerLike;
+  runTurn?: RunTurnFn;
+}
 
 interface RunningInternal extends RunningEntry {
   workerAbort: AbortController;
   workerPromise: Promise<void>;
+  // The issue's open PR + mergeable state, refreshed before each turn.
+  pr: LinkedPullRequest | null;
   // Mid-turn advisory totals from `assistant` events — folded into authoritative
   // totals when the `result` event arrives, then reset.
   advisory_input_tokens: number;
@@ -61,19 +103,22 @@ export class Orchestrator extends EventEmitter {
   private tracker_rate_limits: RateLimitSnapshot | null = null;
 
   private workflow: WorkflowDefinition;
-  private tracker: GitHubTracker;
-  private workspaceManager: WorkspaceManager;
+  private tracker: TrackerLike;
+  private workspaceManager: WorkspaceManagerLike;
+  private runTurnFn: RunTurnFn;
   private tickTimer: NodeJS.Timeout | null = null;
   private stopped = false;
   private effectivePollIntervalMs: number;
   private rateLimitBackoffUntilMs = 0;
   private startedAt = new Date().toISOString();
 
-  constructor(workflow: WorkflowDefinition) {
+  constructor(workflow: WorkflowDefinition, deps: OrchestratorDeps = {}) {
     super();
     this.workflow = workflow;
-    this.tracker = new GitHubTracker(workflow.config.tracker);
-    this.workspaceManager = new WorkspaceManager(workflow.config.workspace.root);
+    this.tracker = deps.tracker ?? new GitHubTracker(workflow.config.tracker);
+    this.workspaceManager =
+      deps.workspaceManager ?? new WorkspaceManager(workflow.config.workspace.root);
+    this.runTurnFn = deps.runTurn ?? runTurn;
     this.effectivePollIntervalMs = workflow.config.polling.interval_ms;
   }
 
@@ -93,7 +138,10 @@ export class Orchestrator extends EventEmitter {
         log.error("tracker reload failed; keeping previous", { error: e.message });
       }
     }
-    if (this.workspaceManager["root"] !== workflow.config.workspace.root) {
+    if (
+      (this.workspaceManager as { root?: string }).root !==
+      workflow.config.workspace.root
+    ) {
       this.workspaceManager = new WorkspaceManager(workflow.config.workspace.root);
     }
     this.effectivePollIntervalMs = workflow.config.polling.interval_ms;
@@ -394,6 +442,7 @@ export class Orchestrator extends EventEmitter {
       advisory_cache_read_input_tokens: 0,
       pauseIntent: null,
       pauseStartTurn: null,
+      pr: null,
     };
     this.running.set(issue.id, entry);
     log.info("dispatch_started", {
@@ -460,6 +509,7 @@ export class Orchestrator extends EventEmitter {
       advisory_cache_read_input_tokens: 0,
       pauseIntent: null,
       pauseStartTurn: null,
+      pr: null,
     };
     this.running.set(paused.issue_id, entry);
     log.info("session_resumed", {
@@ -560,6 +610,26 @@ export class Orchestrator extends EventEmitter {
     return entry.pauseIntent === "graceful";
   }
 
+  /**
+   * Refresh `entry.pr` with the issue's open PR and its mergeable state. A
+   * failure here must never fail the run — on error the PR is treated as absent.
+   */
+  private async fetchLinkedPr(entry: RunningInternal): Promise<void> {
+    const branchName = entry.issue.branch_name;
+    const repository = entry.issue.repository;
+    if (!branchName || !repository) {
+      entry.pr = null;
+      return;
+    }
+    const headRef = `${this.cfg().tracker.branch_prefix}${branchName}`;
+    try {
+      entry.pr = await this.tracker.fetchOpenPullRequestForBranch(repository, headRef);
+    } catch (e: any) {
+      this.handleTrackerError(e, "linked_pr_fetch");
+      entry.pr = null;
+    }
+  }
+
   private async runAttempt(
     entry: RunningInternal,
     attempt: number | null,
@@ -633,6 +703,9 @@ export class Orchestrator extends EventEmitter {
         }
         entry.status = "BuildingPrompt";
         entry.turn_count = turnNumber;
+        // Refresh the issue's linked PR each turn so a conflict that appears
+        // mid-run (or is resolved) is reflected in this turn's prompt.
+        await this.fetchLinkedPr(entry);
         let prompt: string;
         try {
           prompt =
@@ -642,6 +715,11 @@ export class Orchestrator extends EventEmitter {
                   attempt,
                 })
               : buildContinuationPrompt(cfg.claude.continuation_prompt, entry.issue, attempt);
+          // A conflicting PR takes priority: prepend a resolution directive to
+          // whatever prompt was built (works for first-turn and continuation).
+          if (entry.pr && entry.pr.mergeable === "conflicting") {
+            prompt = buildConflictDirective(entry.pr) + "\n\n" + prompt;
+          }
         } catch (e: any) {
           if (e instanceof PromptError) {
             workerExitReason = { error: `${e.code}: ${e.message}` };
@@ -651,7 +729,7 @@ export class Orchestrator extends EventEmitter {
         }
         entry.status = "LaunchingClaude";
 
-        const result = await runTurn({
+        const result = await this.runTurnFn({
           cwd: entry.workspace_path,
           prompt,
           resumeSessionId: sessionId,
@@ -1069,6 +1147,7 @@ export class Orchestrator extends EventEmitter {
         cost_usd: r.total_cost_usd,
         events: r.events.slice(-30),
         workspace_path: r.workspace_path,
+        pr: r.pr,
       };
     });
     const retrying = Array.from(this.retry_attempts.values()).map((r) => ({

@@ -88,6 +88,7 @@ const Icon = {
   play: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 4 20 12 6 20 6 4"/></svg>`,
   caret: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`,
   zap: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`,
+  alert: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.6 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.6a2 2 0 0 0-3.4 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`,
 };
 
 /* ------------------------------------------------------------- count-up hook */
@@ -258,6 +259,17 @@ function SessionCard({ run, open, onToggle, onPause, busy }) {
             <span class=${"pill state" + stateCls}>${run.state || "—"}</span>
             ${run.priority != null
               ? html`<span class="pill prio">P${run.priority}</span>`
+              : null}
+            ${run.pr && run.pr.mergeable === "conflicting"
+              ? html`<a
+                  class="pill pr-conflict"
+                  href=${run.pr.url || "#"}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick=${(e) => e.stopPropagation()}
+                  title=${`PR #${run.pr.number} has merge conflicts — the agent is resolving it`}
+                  >${Icon.alert}<span>PR #${run.pr.number} conflict</span></a
+                >`
               : null}
             ${run.url
               ? html`<a

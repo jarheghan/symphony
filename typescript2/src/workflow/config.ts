@@ -113,6 +113,10 @@ function resolveTracker(raw: Record<string, any>): TrackerConfig {
         : undefined,
     active_states: asStringArray(raw.active_states) ?? defaultActive,
     terminal_states: asStringArray(raw.terminal_states) ?? defaultTerminal,
+    branch_prefix:
+      typeof raw.branch_prefix === "string" && raw.branch_prefix.length > 0
+        ? raw.branch_prefix
+        : "symphony/",
   };
 }
 

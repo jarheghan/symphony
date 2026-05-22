@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s \"http://127.0.0.1:4747/api/v1/state\")",
+      "Bash(node -e \"let s='';process.stdin.on\\('data',d=>s+=d\\).on\\('end',\\(\\)=>{try{const j=JSON.parse\\(s\\);console.log\\('counts:',JSON.stringify\\(j.counts\\)\\);console.log\\('running:',\\(j.running||[]\\).map\\(r=>r.issue_identifier+' ['+r.status+']'\\).join\\(', '\\)||'none'\\);console.log\\('paused:',\\(j.paused||[]\\).map\\(r=>r.issue_identifier+' ['+r.paused_reason+']'\\).join\\(', '\\)||'none'\\);console.log\\('retrying:',\\(j.retrying||[]\\).map\\(r=>r.issue_identifier+' attempt#'+r.attempt+' '+\\(r.error||''\\)\\).join\\(' | '\\)||'none'\\);const m=\\(j.running||[]\\).find\\(r=>/#65$/.test\\(r.issue_identifier\\)\\);if\\(m\\){console.log\\('\\\\\\\\n--- #65 running detail ---'\\);console.log\\(JSON.stringify\\(m,null,1\\)\\);}}catch\\(e\\){console.log\\('parse error / not running:',e.message\\);console.log\\(s.slice\\(0,400\\)\\);}}\\)\")"
+    ]
+  }
+}

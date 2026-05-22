@@ -4,6 +4,7 @@
 import type {
   BlockerRef,
   Issue,
+  LinkedPullRequest,
   RateLimitSnapshot,
   TrackerConfig,
 } from "../types.js";
@@ -172,6 +173,60 @@ export class GitHubTracker {
     const issues = nodes.filter(Boolean).map((n) => this.normalizeIssueNode(n));
     this.updateRateFromGraphQL(result.data?.rateLimit);
     return { issues, rate: this.getRateLimits() };
+  }
+
+  /**
+   * Find the open pull request whose head ref is `headRefName` in `repository`
+   * ("owner/name"), with its `mergeable` (conflict) state. Read-only. Returns
+   * null when no such PR exists.
+   */
+  async fetchOpenPullRequestForBranch(
+    repository: string,
+    headRefName: string,
+  ): Promise<LinkedPullRequest | null> {
+    const [owner, name] = (repository || "").split("/", 2);
+    if (!owner || !name) {
+      throw new TrackerError(
+        "missing_tracker_repository_or_project",
+        `Invalid repository slug: ${repository}`,
+      );
+    }
+    const query = `
+      query($owner:String!, $name:String!, $head:String!) {
+        repository(owner:$owner, name:$name) {
+          pullRequests(headRefName:$head, states: OPEN, first: 5, orderBy:{field: UPDATED_AT, direction: DESC}) {
+            nodes {
+              number
+              url
+              mergeable
+              isDraft
+              baseRefName
+              headRefName
+            }
+          }
+        }
+        rateLimit { remaining resetAt cost }
+      }`;
+    const result = await this.graphql(query, { owner, name, head: headRefName });
+    this.updateRateFromGraphQL(result.data?.rateLimit);
+    const nodes = (result.data?.repository?.pullRequests?.nodes || []) as any[];
+    if (nodes.length === 0) return null;
+    if (nodes.length > 1) {
+      log.warn("github_multiple_prs_for_head", {
+        head_ref: headRefName,
+        repository,
+        count: nodes.length,
+      });
+    }
+    const n = nodes[0]; // most recently updated
+    return {
+      number: n.number,
+      url: n.url ?? null,
+      mergeable: normalizeMergeable(n.mergeable),
+      is_draft: n.isDraft === true,
+      base_ref_name: n.baseRefName ?? "",
+      head_ref_name: n.headRefName ?? headRefName,
+    };
   }
 
   private async fetchFromRepository(): Promise<FetchResult> {
@@ -579,6 +634,12 @@ export class GitHubTracker {
     if (typeof rl.remaining === "number") this.ctx.rate.graphql_remaining = rl.remaining;
     if (rl.resetAt) this.ctx.rate.graphql_reset_at = rl.resetAt;
   }
+}
+
+function normalizeMergeable(v: any): LinkedPullRequest["mergeable"] {
+  if (v === "CONFLICTING") return "conflicting";
+  if (v === "MERGEABLE") return "mergeable";
+  return "unknown";
 }
 
 function defaultBranchName(number: number, title: string): string {

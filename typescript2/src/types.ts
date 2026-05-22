@@ -49,6 +49,11 @@ export interface TrackerConfig {
   };
   active_states: string[];
   terminal_states: string[];
+  /**
+   * Prefix the workspace `before_run` hook prepends to `issue.branch_name` to
+   * form the PR head ref. Lets Symphony look up an issue's PR deterministically.
+   */
+  branch_prefix: string;
 }
 
 export interface PollingConfig {
@@ -127,6 +132,20 @@ export type RunAttemptStatus =
   | "Paused"
   | "CanceledByReconciliation";
 
+/**
+ * The open pull request linked to an issue (by head ref), with its GitHub
+ * `mergeable` state. Surfaced so the agent can be told to resolve conflicts.
+ */
+export interface LinkedPullRequest {
+  number: number;
+  url: string | null;
+  /** Normalized from GitHub's `mergeable` enum (`MERGEABLE`/`CONFLICTING`/`UNKNOWN`). */
+  mergeable: "mergeable" | "conflicting" | "unknown";
+  is_draft: boolean;
+  base_ref_name: string;
+  head_ref_name: string;
+}
+
 export interface LiveSession {
   session_id: string | null;
   thread_id: string | null;
@@ -157,6 +176,8 @@ export interface RunningEntry extends LiveSession {
   started_at: string;
   error?: string;
   events: RuntimeEvent[]; // recent events (bounded)
+  /** The issue's open PR + mergeable state, refreshed each turn (null if none). */
+  pr?: LinkedPullRequest | null;
 }
 
 /**
